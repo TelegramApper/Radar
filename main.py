@@ -609,14 +609,7 @@ async def list_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def start_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "FC26 Elite Tracker Bot is running.\n\n"
-        "Important:\n"
-        "1) Start me in private once so I can send your reports there later.\n"
-        "2) Disable Privacy Mode in BotFather or make the bot admin so it can read group messages.\n"
-        "3) Use reply + .add for the safest player add flow."
-    )
-    await update.effective_message.reply_text(text)
+    await update.effective_message.reply_text("Bot is active.")
 
 
 async def track_group_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
