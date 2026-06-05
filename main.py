@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from telegram import Update, User
-from telegram.constants import ChatType, ParseMode
+from telegram.constants import ChatType
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -27,7 +27,7 @@ logger = logging.getLogger("fc26_elite_tracker")
 OWNER_ID = int(os.getenv("OWNER_ID", "813607344"))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DB_PATH = os.getenv("DB_PATH", "/data/fc26_elite_tracker.db")
-TIMEZONE_OFFSET_HOURS = int(os.getenv("TIMEZONE_OFFSET_HOURS", "3"))
+TIMEZONE_OFFSET_HOURS = int(os.getenv("TIMEZONE_OFFSET_HOURS", "2"))
 SUSPECT_THRESHOLD = int(os.getenv("SUSPECT_THRESHOLD", "15"))
 TOP_LIMIT = int(os.getenv("TOP_LIMIT", "20"))
 MESSAGE_LOG_LIMIT = int(os.getenv("MESSAGE_LOG_LIMIT", "1000"))
@@ -319,14 +319,6 @@ class Database:
 db = Database(DB_PATH)
 
 
-def escape_md(text: str) -> str:
-    chars = r"_*[]()~`>#+-=|{}.!"
-    out = text
-    for ch in chars:
-        out = out.replace(ch, f"\\{ch}")
-    return out
-
-
 def display_handle(row_or_stats) -> str:
     username = row_or_stats["username"] if isinstance(row_or_stats, sqlite3.Row) else row_or_stats.get("username")
     display_name = row_or_stats["display_name"] if isinstance(row_or_stats, sqlite3.Row) else row_or_stats.get("display_name")
@@ -388,6 +380,7 @@ async def reject_unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[TargetPlayer]:
     message = update.effective_message
     args = context.args
+
     if message and message.reply_to_message and message.reply_to_message.from_user:
         u = message.reply_to_message.from_user
         return TargetPlayer(
@@ -395,15 +388,18 @@ async def resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             username=u.username.lower() if u.username else None,
             display_name=u.full_name or u.first_name,
         )
+
     if args:
-        username = args[0].lstrip("@").lower()
-        row = db.find_player_by_username(username)
-        if row:
-            return TargetPlayer(
-                user_id=row["user_id"],
-                username=row["username"],
-                display_name=row["display_name"],
-            )
+        first_arg = args[0].strip()
+        if not first_arg.isdigit():
+            username = first_arg.lstrip("@").lower()
+            row = db.find_player_by_username(username)
+            if row:
+                return TargetPlayer(
+                    user_id=row["user_id"],
+                    username=row["username"],
+                    display_name=row["display_name"],
+                )
     return None
 
 
@@ -412,11 +408,9 @@ async def send_private_or_notice(update: Update, context: ContextTypes.DEFAULT_T
     if update.effective_chat and update.effective_chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
         await update.effective_message.reply_text("Report sent privately.")
     try:
-        await context.bot.send_message(chat_id=user.id, text=text, parse_mode=ParseMode.MARKDOWN_V2)
-    except Exception:
-        await update.effective_message.reply_text(
-            "I couldn't send you a private message. Start the bot in private first, then try again."
-        )
+        await context.bot.send_message(chat_id=user.id, text=text)
+    except Exception as e:
+        await update.effective_message.reply_text(f"Private send failed: {e}")
 
 
 async def add_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -474,14 +468,15 @@ async def check_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if stats["added_at"] is None:
         await update.effective_message.reply_text("Player is not tracked")
         return
+
     text = (
-        f"*Player:* {escape_md(display_handle(stats))}\n\n"
-        f"*Total Contributions:* {stats['total']}\n\n"
-        f"*Current Rank:* #{stats['current_rank'] or '-'}\n\n"
-        f"*Daily Contributions:* {stats['daily']}\n\n"
-        f"*Weekly Contributions:* {stats['weekly']}\n\n"
-        f"*Last Seen:* {escape_md(humanize_delta(stats['last_seen_at']))}\n\n"
-        f"*Tracked Since:* {escape_md(stats['added_at'][:10])}"
+        f"Player: {display_handle(stats)}\n\n"
+        f"Total Contributions: {stats['total']}\n\n"
+        f"Current Rank: #{stats['current_rank'] or '-'}\n\n"
+        f"Daily Contributions: {stats['daily']}\n\n"
+        f"Weekly Contributions: {stats['weekly']}\n\n"
+        f"Last Seen: {humanize_delta(stats['last_seen_at'])}\n\n"
+        f"Tracked Since: {stats['added_at'][:10]}"
     )
     await send_private_or_notice(update, context, text)
 
@@ -493,26 +488,26 @@ async def player_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not target:
         await update.effective_message.reply_text("Use /msg @username [20|50|100] or reply + .msg")
         return
+
     limit = 20
-    if context.args:
-        try:
-            maybe_num = int(context.args[-1])
-            if maybe_num in {20, 50, 100}:
-                limit = maybe_num
-        except Exception:
-            pass
+    numeric_args = [arg for arg in context.args if arg.isdigit()]
+    if numeric_args:
+        maybe_num = int(numeric_args[-1])
+        if maybe_num in {20, 50, 100}:
+            limit = maybe_num
+
     rows = db.recent_messages(target.user_id, limit=limit)
     if not rows:
         await update.effective_message.reply_text("No messages found for this player")
         return
-    lines = [
-        f"*Last {len(rows)} messages for* {escape_md(display_handle({'username': target.username, 'display_name': target.display_name}))}\n"
-    ]
+
+    lines = [f"Last {len(rows)} messages for {display_handle({'username': target.username, 'display_name': target.display_name})}", ""]
     for i, row in enumerate(rows, start=1):
-        marker = "\\+1" if row["contribution_count"] else "0"
-        body = escape_md(row["message_text"][:300])
-        ts = escape_md(datetime.fromisoformat(row["created_at"]).strftime("%Y-%m-%d %H:%M"))
-        lines.append(f"{i}\\. \\[{ts}\\] \\({marker}\\) {body}")
+        marker = "+1" if row["contribution_count"] else "0"
+        ts = datetime.fromisoformat(row["created_at"]).strftime("%Y-%m-%d %H:%M")
+        body = row["message_text"][:300]
+        lines.append(f"{i}. [{ts}] ({marker}) {body}")
+
     await send_private_or_notice(update, context, "\n".join(lines))
 
 
@@ -528,17 +523,19 @@ async def player_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not stats["added_at"]:
         await update.effective_message.reply_text("Player is not tracked")
         return
+
     tracked_since = datetime.fromisoformat(stats["added_at"])
     days = max(1, (now_utc() - tracked_since).days + 1)
     avg_daily = round(stats["total"] / days)
+
     text = (
-        f"*Player:* {escape_md(display_handle(stats))}\n\n"
-        f"*Tracked Since:* {escape_md(stats['added_at'][:10])}\n\n"
-        f"*Total Contributions:* {stats['total']}\n\n"
-        f"*Average Daily Contributions:* {avg_daily}\n\n"
-        f"*Highest Rank:* #{stats['highest_rank'] or '-'}\n\n"
-        f"*Current Rank:* #{stats['current_rank'] or '-'}\n\n"
-        f"*Last Seen:* {escape_md(humanize_delta(stats['last_seen_at']))}"
+        f"Player: {display_handle(stats)}\n\n"
+        f"Tracked Since: {stats['added_at'][:10]}\n\n"
+        f"Total Contributions: {stats['total']}\n\n"
+        f"Average Daily Contributions: {avg_daily}\n\n"
+        f"Highest Rank: #{stats['highest_rank'] or '-'}\n\n"
+        f"Current Rank: #{stats['current_rank'] or '-'}\n\n"
+        f"Last Seen: {humanize_delta(stats['last_seen_at'])}"
     )
     await send_private_or_notice(update, context, text)
 
@@ -609,13 +606,14 @@ async def list_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def start_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("Bot is active.")
+    return
 
 
 async def track_group_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     user = update.effective_user
     chat = update.effective_chat
+
     if not message or not user or not chat:
         return
     if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
@@ -624,6 +622,7 @@ async def track_group_messages(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     if not db.is_tracked(user.id):
         return
+
     text = message.text or message.caption or ""
     db.update_seen(user)
     contribution = is_contribution(text, db.get_keywords())
@@ -631,23 +630,37 @@ async def track_group_messages(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def dot_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.effective_message.text or "").strip().lower()
-    if text == ".add":
+    text = (update.effective_message.text or "").strip()
+    lower = text.lower()
+
+    if lower == ".add":
+        context.args = []
         await add_player(update, context)
-    elif text == ".remove":
+
+    elif lower == ".remove":
+        context.args = []
         await remove_player(update, context)
-    elif text == ".ch":
+
+    elif lower == ".ch":
+        context.args = []
         await check_player(update, context)
-    elif text == ".msg":
+
+    elif lower.startswith(".msg"):
+        parts = text.split()
+        context.args = parts[1:]
         await player_messages(update, context)
-    elif text == ".history":
+
+    elif lower == ".history":
+        context.args = []
         await player_history(update, context)
 
 
 def build_app() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is missing")
+
     application = Application.builder().token(BOT_TOKEN).build()
+
     application.add_handler(CommandHandler("start", start_private))
     application.add_handler(CommandHandler("add", add_player))
     application.add_handler(CommandHandler("remove", remove_player))
@@ -660,12 +673,18 @@ def build_app() -> Application:
     application.add_handler(CommandHandler("addkw", add_keyword))
     application.add_handler(CommandHandler("removekw", remove_keyword))
     application.add_handler(CommandHandler("keywords", list_keywords))
+
     application.add_handler(
-        MessageHandler(filters.TEXT & filters.Regex(r"^\.(add|remove|ch|msg|history)$"), dot_router)
+        MessageHandler(
+            filters.TEXT & filters.Regex(r"^\.(add|remove|ch|msg|history)(\s+\d+)?$"),
+            dot_router,
+        )
     )
+
     application.add_handler(
         MessageHandler((filters.TEXT | filters.CaptionRegex(r".+")) & ~filters.COMMAND, track_group_messages)
     )
+
     return application
 
 
