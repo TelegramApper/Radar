@@ -32,6 +32,13 @@ SUSPECT_THRESHOLD = int(os.getenv("SUSPECT_THRESHOLD", "15"))
 TOP_LIMIT = int(os.getenv("TOP_LIMIT", "20"))
 MESSAGE_LOG_LIMIT = int(os.getenv("MESSAGE_LOG_LIMIT", "1000"))
 
+# حط هنا IDs الناس اللي مسموحلهم add فقط
+ADD_ONLY_USER_IDS = {
+    848523015,
+    8025004558,
+    2029428163,
+}
+
 DEFAULT_KEYWORDS = [
     "Prendete",
     "Tua",
@@ -77,7 +84,7 @@ class Database:
         self._init_db()
 
     def connect(self):
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -354,7 +361,7 @@ def is_contribution(text: str, keywords: Iterable[str]) -> bool:
     return has_keyword or has_three_digit
 
 
-async def is_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+async def has_full_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
     chat = update.effective_chat
     if not user or not chat:
@@ -371,10 +378,15 @@ async def is_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
         return False
 
 
-async def reject_unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if await is_authorized(update, context):
+def has_add_only_access(update: Update) -> bool:
+    user = update.effective_user
+    if not user:
         return False
-    return True
+    return user.id in ADD_ONLY_USER_IDS
+
+
+async def can_use_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    return await has_full_access(update, context) or has_add_only_access(update)
 
 
 async def resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[TargetPlayer]:
@@ -403,70 +415,67 @@ async def resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return None
 
 
-async def send_private_or_notice(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+async def send_private_silent(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     user = update.effective_user
-    if update.effective_chat and update.effective_chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
-        await update.effective_message.reply_text("Report sent privately.")
+    if not user:
+        return
     try:
         await context.bot.send_message(chat_id=user.id, text=text)
     except Exception as e:
-        await update.effective_message.reply_text(f"Private send failed: {e}")
+        logger.warning("Private send failed for %s: %s", user.id, e)
 
 
 async def add_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await reject_unauthorized(update, context):
+    if not await can_use_add(update, context):
         return
+
     message = update.effective_message
+    if not message:
+        return
+
     target_user = None
 
     if message.reply_to_message and message.reply_to_message.from_user:
         target_user = message.reply_to_message.from_user
     elif context.args:
         username = context.args[0].lstrip("@")
-        await message.reply_text(
-            "Use reply + .add for guaranteed accuracy, or let the player send a message first so the bot can learn their User ID."
-        )
         row = db.find_player_by_username(username)
         if row:
-            await message.reply_text(f"@{row['username']} is already known. Use reply + .add for a safe add.")
+            await message.reply_text(f"@{row['username']} è già presente nel sistema di monitoraggio.")
         return
     else:
-        await message.reply_text("Usage: /add by reply, or .add as a reply to the player's message.")
         return
 
     created = db.upsert_player(target_user, update.effective_user.id)
     handle = f"@{target_user.username}" if target_user.username else target_user.full_name
+
     if created:
-        await message.reply_text(f"{handle} added to Elite Tracking System")
+        await message.reply_text(f"{handle} è stato aggiunto al sistema di monitoraggio Elite.")
     else:
-        await message.reply_text(f"{handle} is already tracked")
+        await message.reply_text(f"{handle} è già presente nel sistema di monitoraggio.")
 
 
 async def remove_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await reject_unauthorized(update, context):
+    if not await has_full_access(update, context):
         return
     target = await resolve_target(update, context)
     if not target:
-        await update.effective_message.reply_text("Use /remove @username for tracked usernames, or reply + .remove.")
         return
     removed = db.remove_player(target.user_id)
     handle = f"@{target.username}" if target.username else target.display_name
-    await update.effective_message.reply_text(
-        f"{handle} removed from Elite Tracking System" if removed else f"{handle} is not tracked"
-    )
+    if removed:
+        await update.effective_message.reply_text(f"{handle} removed from Elite Tracking System")
 
 
 async def check_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await reject_unauthorized(update, context):
+    if not await has_full_access(update, context):
         return
     target = await resolve_target(update, context)
     if not target:
-        await update.effective_message.reply_text("Use /ch @username or reply + .ch")
         return
     db.refresh_ranks()
     stats = db.player_stats(target.user_id)
     if stats["added_at"] is None:
-        await update.effective_message.reply_text("Player is not tracked")
         return
 
     text = (
@@ -478,15 +487,14 @@ async def check_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Last Seen: {humanize_delta(stats['last_seen_at'])}\n\n"
         f"Tracked Since: {stats['added_at'][:10]}"
     )
-    await send_private_or_notice(update, context, text)
+    await send_private_silent(update, context, text)
 
 
 async def player_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await reject_unauthorized(update, context):
+    if not await has_full_access(update, context):
         return
     target = await resolve_target(update, context)
     if not target:
-        await update.effective_message.reply_text("Use /msg @username [20|50|100] or reply + .msg")
         return
 
     limit = 20
@@ -498,7 +506,6 @@ async def player_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     rows = db.recent_messages(target.user_id, limit=limit)
     if not rows:
-        await update.effective_message.reply_text("No messages found for this player")
         return
 
     lines = [f"Last {len(rows)} messages for {display_handle({'username': target.username, 'display_name': target.display_name})}", ""]
@@ -508,20 +515,18 @@ async def player_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         body = row["message_text"][:300]
         lines.append(f"{i}. [{ts}] ({marker}) {body}")
 
-    await send_private_or_notice(update, context, "\n".join(lines))
+    await send_private_silent(update, context, "\n".join(lines))
 
 
 async def player_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await reject_unauthorized(update, context):
+    if not await has_full_access(update, context):
         return
     target = await resolve_target(update, context)
     if not target:
-        await update.effective_message.reply_text("Use /history @username or reply + .history")
         return
     db.refresh_ranks()
     stats = db.player_stats(target.user_id)
     if not stats["added_at"]:
-        await update.effective_message.reply_text("Player is not tracked")
         return
 
     tracked_since = datetime.fromisoformat(stats["added_at"])
@@ -537,15 +542,14 @@ async def player_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Current Rank: #{stats['current_rank'] or '-'}\n\n"
         f"Last Seen: {humanize_delta(stats['last_seen_at'])}"
     )
-    await send_private_or_notice(update, context, text)
+    await send_private_silent(update, context, text)
 
 
 async def top_players(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await reject_unauthorized(update, context):
+    if not await has_full_access(update, context):
         return
     ranked = db.refresh_ranks()[:TOP_LIMIT]
     if not ranked:
-        await update.effective_message.reply_text("No tracked players yet")
         return
     lines = ["Elite Contribution Ranking", ""]
     for item in ranked:
@@ -554,12 +558,11 @@ async def top_players(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def suspects(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await reject_unauthorized(update, context):
+    if not await has_full_access(update, context):
         return
     ranked = db.refresh_ranks()
     suspects_rows = [x for x in ranked if x["total"] <= SUSPECT_THRESHOLD]
     if not suspects_rows:
-        await update.effective_message.reply_text("No potential inactive players right now")
         return
     lines = ["Potential Inactive Players", ""]
     for item in suspects_rows:
@@ -568,7 +571,7 @@ async def suspects(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def list_players(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await reject_unauthorized(update, context):
+    if not await has_full_access(update, context):
         return
     rows = db.tracked_players()
     lines = [f"Tracked Players ({len(rows)})", ""]
@@ -577,29 +580,29 @@ async def list_players(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await reject_unauthorized(update, context):
+    if not await has_full_access(update, context):
         return
     if not context.args:
-        await update.effective_message.reply_text("Usage: /addkw Keyword")
         return
     keyword = " ".join(context.args).strip()
     created = db.add_keyword(keyword, update.effective_user.id)
-    await update.effective_message.reply_text("Keyword added" if created else "Keyword already exists")
+    if created:
+        await update.effective_message.reply_text("Keyword added")
 
 
 async def remove_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await reject_unauthorized(update, context):
+    if not await has_full_access(update, context):
         return
     if not context.args:
-        await update.effective_message.reply_text("Usage: /removekw Keyword")
         return
     keyword = " ".join(context.args).strip()
     removed = db.remove_keyword(keyword)
-    await update.effective_message.reply_text("Keyword removed" if removed else "Keyword not found")
+    if removed:
+        await update.effective_message.reply_text("Keyword removed")
 
 
 async def list_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await reject_unauthorized(update, context):
+    if not await has_full_access(update, context):
         return
     kws = db.get_keywords()
     await update.effective_message.reply_text("Current Keywords\n\n" + "\n".join(kws))
@@ -618,12 +621,17 @@ async def track_group_messages(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
         return
-    if message.text and message.text.startswith(("/", ".")):
+
+    text = message.text or message.caption or ""
+    if not text:
         return
+
+    if text.startswith("/") or text.startswith("."):
+        return
+
     if not db.is_tracked(user.id):
         return
 
-    text = message.text or message.caption or ""
     db.update_seen(user)
     contribution = is_contribution(text, db.get_keywords())
     db.add_message(user.id, chat.id, message.message_id, text, contribution)
