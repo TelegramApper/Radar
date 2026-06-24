@@ -590,7 +590,7 @@ async def send_private_or_group_notice(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     text: str,
-    fail_notice: str = "Unable to send private message. Please start the bot in DM first.",
+    fail_notice: str = "Impossibile inviare un messaggio privato. Per favore, avvia prima il bot in privato (DM).",
 ):
     sent = await send_private_text(update, context, text)
     if update.effective_chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
@@ -634,9 +634,9 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     handle = f"@{target_user.username}" if getattr(target_user, "username", None) else (target_user.full_name or target_user.first_name)
 
     if inserted:
-        await msg.reply_text(f"{handle} added to Elite Tracking System")
+        await msg.reply_text(f"{handle} è stato aggiunto al sistema di monitoraggio Elite.")
     else:
-        await msg.reply_text(f"{handle} is already in Elite Tracking System")
+        await msg.reply_text(f"{handle} è già presente nel sistema di monitoraggio.")
 
 async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_authorized(update, context):
