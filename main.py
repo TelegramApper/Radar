@@ -881,9 +881,9 @@ async def handle_dot_commands(update: Update, context: ContextTypes.DEFAULT_TYPE
         inserted = db.upsert_player(TempUser(), update.effective_user.id)
         handle = f"@{target.username}" if target.username else target.display_name
         if inserted:
-            await msg.reply_text(f"{handle} added to Elite Tracking System")
+            await msg.reply_text(f"{handle} è stato aggiunto al sistema di monitoraggio Elite.")
         else:
-            await msg.reply_text(f"{handle} is already in Elite Tracking System")
+            await msg.reply_text(f"{handle} è già presente nel sistema di monitoraggio.")
         return
 
     if text.lower().startswith(".note"):
