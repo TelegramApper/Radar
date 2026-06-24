@@ -337,6 +337,41 @@ class Database:
                 "SELECT * FROM tracked_players ORDER BY COALESCE(username, display_name) COLLATE NOCASE"
             ).fetchall()
 
+    def remember_user(self, user: User):
+        username = user.username.lower() if user.username else None
+        display_name = (user.full_name or user.first_name or str(user.id)).strip()
+        with closing(self.connect()) as conn, conn:
+            existing = conn.execute(
+                "SELECT user_id, added_at, added_by, highest_rank, last_rank FROM tracked_players WHERE user_id = ?",
+                (user.id,),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE tracked_players SET username = ?, display_name = ?, last_seen_at = ? WHERE user_id = ?",
+                    (username, display_name, iso_now(), user.id),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO tracked_players(user_id, username, display_name, added_at, added_by, last_seen_at, highest_rank, last_rank)
+                    VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
+                    """,
+                    (user.id, username, display_name, iso_now(), 0, iso_now()),
+                )
+
+    def recent_messages_any_user(self, user_id: int, limit: int = 20):
+        with closing(self.connect()) as conn:
+            return conn.execute(
+                """
+                SELECT message_text, contribution_count, created_at
+                FROM contributions
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (user_id, limit),
+            ).fetchall()
+
     def add_note(self, player_user_id: int, note_text: str, issuer_user_id: int, issuer_name: str):
         with closing(self.connect()) as conn, conn:
             conn.execute(
@@ -616,7 +651,7 @@ async def ch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines += ["", "Recent Notes:"]
         for n in recent_notes:
             lines.append(f"- {format_date_only(n['created_at'])} | {n['note_text']} | by {n['issuer_name']}")
-    await send_private_text(update, context, "\n".join(lines))
+    await send_private_or_group_notice(update, context, "\n".join(lines))
 
 
 async def msg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -631,7 +666,7 @@ async def msg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     limit = 20
     if len(context.args) >= 2 and context.args[1].isdigit():
         limit = max(1, min(100, int(context.args[1])))
-    rows = db.recent_messages(target.user_id, limit)
+    rows = db.recent_messages_any_user(target.user_id, limit)
     handle = f"@{target.username}" if target.username else target.display_name
     lines = [f"Last Messages for {handle}", ""]
     for i, r in enumerate(rows, start=1):
@@ -674,7 +709,7 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines += ["", "All Notes:"]
         for i, n in enumerate(notes, start=1):
             lines.append(f"{i}. {format_date_only(n['created_at'])} | {n['note_text']} | by {n['issuer_name']}")
-    await send_private_text(update, context, "\n".join(lines))
+    await send_private_or_group_notice(update, context, "\n".join(lines))
 
 
 async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -685,7 +720,7 @@ async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for item in ranked:
         handle = f"@{item['username']}" if item["username"] else item["display_name"]
         lines.append(f"#{item['rank']} {handle} - {item['total']}")
-    await send_private_text(update, context, "\n".join(lines))
+    await send_private_or_group_notice(update, context, "\n".join(lines))
 
 
 async def suspects_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -697,17 +732,21 @@ async def suspects_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for item in suspects:
         handle = f"@{item['username']}" if item["username"] else item["display_name"]
         lines.append(f"{handle} - {item['total']} contributions")
-    await send_private_text(update, context, "\n".join(lines))
+    await send_private_or_group_notice(update, context, "\n".join(lines))
 
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_authorized(update, context):
         return
     rows = db.tracked_players()
+    if not rows:
+        await send_private_or_group_notice(update, context, "Tracked Players (0)")
+        return
     lines = [f"Tracked Players ({len(rows)})", ""]
-    for r in rows:
-        lines.append(display_handle(r))
-    await send_private_text(update, context, "\n".join(lines))
+    for i, r in enumerate(rows, start=1):
+        handle = display_handle(r)
+        lines.append(f"{i}. {handle}")
+    await send_private_or_group_notice(update, context, "\n".join(lines))
 
 
 async def addkw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -730,7 +769,7 @@ async def keywords_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_authorized(update, context):
         return
     lines = ["Keywords", ""] + db.get_keywords()
-    await send_private_text(update, context, "\n".join(lines))
+    await send_private_or_group_notice(update, context, "\n".join(lines))
 
 
 async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -746,7 +785,7 @@ async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for r in rows:
             handle = f"@{r['username']}" if r["username"] else r["display_name"]
             lines.append(f"{handle} — {r['notes_count']} notes")
-        await send_private_text(update, context, "\n".join(lines))
+        await send_private_or_group_notice(update, context, "\n".join(lines))
         return
     if len(args) == 1 and args[0].lower() == "full":
         grouped = db.all_notes_grouped()
@@ -761,7 +800,7 @@ async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for i, n in enumerate(block["notes"], start=1):
                 lines.append(f"{i}. {format_date_only(n['created_at'])} | {n['note_text']} | by {n['issuer_name']}")
             lines.append("")
-        await send_private_text(update, context, "\n".join(lines).strip())
+        await send_private_or_group_notice(update, context, "\n".join(lines).strip())
         return
     if len(args) == 1 and args[0].startswith("@"):
         target = find_target_by_username_arg(args[0])
@@ -776,7 +815,7 @@ async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = [f"Notes for {handle}", ""]
         for i, n in enumerate(notes, start=1):
             lines.append(f"{i}. {format_date_only(n['created_at'])} | {n['note_text']} | by {n['issuer_name']}")
-        await send_private_text(update, context, "\n".join(lines))
+        await send_private_or_group_notice(update, context, "\n".join(lines))
         return
     await send_private_text(update, context, "Usage:\n/notes\n/notes full\n/notes @username")
 
@@ -873,10 +912,13 @@ async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not msg.text or msg.text.startswith("/") or msg.text.startswith("."):
         return
     user = msg.from_user
-    if not user or not db.is_tracked(user.id):
+    if not user:
         return
-    db.update_seen(user)
-    is_contrib = message_is_contribution(msg.text, db.get_keywords())
+    db.remember_user(user)
+    is_contrib = False
+    if db.is_tracked(user.id):
+        db.update_seen(user)
+        is_contrib = message_is_contribution(msg.text, db.get_keywords())
     db.add_message(user.id, update.effective_chat.id, msg.message_id, msg.text, is_contrib)
 
 
