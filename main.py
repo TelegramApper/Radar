@@ -595,7 +595,7 @@ async def send_private_or_group_notice(
     sent = await send_private_text(update, context, text)
     if update.effective_chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         if sent:
-            await update.effective_message.reply_text("Report sent privately.")
+            await update.effective_message.reply_text("Segnalazione inviata in privato.")
         else:
             await update.effective_message.reply_text(fail_notice)
     return sent
