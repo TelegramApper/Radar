@@ -918,16 +918,7 @@ async def handle_dot_commands(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if text.lower() == ".remove":
-        if not await is_authorized(update, context):
-            return
-        target = get_target_from_reply(update)
-        if target:
-            db.remove_player(target.user_id)
-        return
-
-    if text.lower() == ".ch":
-        if not await is_authorized(update, context):
-            return
+        if not await is_authorized(update, conte
         context.args = []
         await ch_command(update, context)
         return
