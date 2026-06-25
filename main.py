@@ -572,12 +572,19 @@ async def can_add_only(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
 
 
 async def is_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    user_id = update.effective_user.id
+    user_id = update.effective_user.id if update.effective_user else None
     if user_id == OWNER_ID:
         return True
+
     chat = update.effective_chat
-    if chat and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-        return await is_admin(chat.id, user_id, context)
+    msg = update.effective_message
+
+    if chat and msg and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        if msg.sender_chat and msg.sender_chat.id == chat.id:
+            return True
+        if user_id is not None:
+            return await is_admin(chat.id, user_id, context)
+
     return False
 
 
