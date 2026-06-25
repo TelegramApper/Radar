@@ -22,15 +22,16 @@ logging.basicConfig(
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("fc26_elite_tracker")
+logger = logging.getLogger("fc26elite-tracker")
 
 OWNER_ID = int(os.getenv("OWNER_ID", "813607344"))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-DB_PATH = os.getenv("DB_PATH", "/data/fc26_elite_tracker.db")
+DB_PATH = os.getenv("DB_PATH", "data/fc26_elite_tracker.db")
 TIMEZONE_OFFSET_HOURS = int(os.getenv("TIMEZONE_OFFSET_HOURS", "2"))
 SUSPECT_THRESHOLD = int(os.getenv("SUSPECT_THRESHOLD", "15"))
 TOP_LIMIT = int(os.getenv("TOP_LIMIT", "20"))
 MESSAGE_LOG_LIMIT = int(os.getenv("MESSAGE_LOG_LIMIT", "1000"))
+MAX_TELEGRAM_MESSAGE = 3900
 
 ADD_ONLY_USER_IDS = {
     848523015,
@@ -53,7 +54,7 @@ DEFAULT_KEYWORDS = [
     "Gift",
 ]
 
-THREE_DIGIT_RE = re.compile(r"(?<!\d)([1-9]\d{2})(?!\d)")
+THREE_DIGIT_RE = re.compile(r"(?<!\d)(\d{3})(?!\d)")
 
 
 def now_utc() -> datetime:
@@ -83,17 +84,16 @@ class Database:
     def __init__(self, path: str):
         ensure_parent(path)
         self.path = path
-        self._init_db()
+        self.init_db()
 
     def connect(self):
         conn = sqlite3.connect(self.path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
 
-    def _init_db(self):
+    def init_db(self):
         with closing(self.connect()) as conn, conn:
-            conn.execute(
-                """
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS tracked_players (
                     user_id INTEGER PRIMARY KEY,
                     username TEXT,
@@ -104,10 +104,8 @@ class Database:
                     highest_rank INTEGER,
                     last_rank INTEGER
                 )
-                """
-            )
-            conn.execute(
-                """
+            """)
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS contributions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
@@ -118,19 +116,15 @@ class Database:
                     created_at TEXT NOT NULL,
                     FOREIGN KEY (user_id) REFERENCES tracked_players(user_id)
                 )
-                """
-            )
-            conn.execute(
-                """
+            """)
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS keywords (
                     keyword TEXT PRIMARY KEY,
                     added_at TEXT NOT NULL,
                     added_by INTEGER
                 )
-                """
-            )
-            conn.execute(
-                """
+            """)
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS notes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     player_user_id INTEGER NOT NULL,
@@ -140,8 +134,7 @@ class Database:
                     created_at TEXT NOT NULL,
                     FOREIGN KEY (player_user_id) REFERENCES tracked_players(user_id)
                 )
-                """
-            )
+            """)
             existing = conn.execute("SELECT COUNT(*) AS c FROM keywords").fetchone()["c"]
             if existing == 0:
                 conn.executemany(
@@ -149,9 +142,9 @@ class Database:
                     [(kw, iso_now(), OWNER_ID) for kw in DEFAULT_KEYWORDS],
                 )
 
-    def upsert_player(self, user: User, added_by: int):
+    def upsert_player(self, user: User, added_by: int) -> bool:
         username = user.username.lower() if user.username else None
-        display_name = (user.full_name or user.first_name or str(user.id)).strip()
+        display_name = user.full_name or user.first_name or str(user.id)
         with closing(self.connect()) as conn, conn:
             exists = conn.execute(
                 "SELECT user_id FROM tracked_players WHERE user_id = ?",
@@ -165,14 +158,15 @@ class Database:
                 return False
             conn.execute(
                 """
-                INSERT INTO tracked_players(user_id, username, display_name, added_at, added_by, last_seen_at, highest_rank, last_rank)
+                INSERT INTO tracked_players
+                (user_id, username, display_name, added_at, added_by, last_seen_at, highest_rank, last_rank)
                 VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
                 """,
                 (user.id, username, display_name, iso_now(), added_by, iso_now()),
             )
             return True
 
-    def remove_player(self, user_id: int):
+    def remove_player(self, user_id: int) -> bool:
         with closing(self.connect()) as conn, conn:
             deleted = conn.execute(
                 "DELETE FROM tracked_players WHERE user_id = ?",
@@ -183,10 +177,14 @@ class Database:
     def update_seen(self, user: User):
         with closing(self.connect()) as conn, conn:
             conn.execute(
-                "UPDATE tracked_players SET username = ?, display_name = ?, last_seen_at = ? WHERE user_id = ?",
+                """
+                UPDATE tracked_players
+                SET username = ?, display_name = ?, last_seen_at = ?
+                WHERE user_id = ?
+                """,
                 (
                     user.username.lower() if user.username else None,
-                    (user.full_name or user.first_name or str(user.id)).strip(),
+                    user.full_name or user.first_name or str(user.id),
                     iso_now(),
                     user.id,
                 ),
@@ -210,21 +208,14 @@ class Database:
                 (user_id, text[:4000], chat_id, message_id, 1 if is_contribution else 0, iso_now()),
             )
             conn.execute(
-                "UPDATE tracked_players SET last_seen_at = ? WHERE user_id = ?",
-                (iso_now(), user_id),
-            )
-            conn.execute(
-                """
-                DELETE FROM contributions
-                WHERE id IN (
-                    SELECT id FROM contributions
-                    WHERE user_id = ?
-                    ORDER BY created_at DESC
-                    LIMIT -1 OFFSET ?
-                )
-                """,
+                "DELETE FROM contributions WHERE id IN (SELECT id FROM contributions WHERE user_id = ? ORDER BY created_at DESC LIMIT -1 OFFSET ?)",
                 (user_id, MESSAGE_LOG_LIMIT),
             )
+            if self.is_tracked(user_id):
+                conn.execute(
+                    "UPDATE tracked_players SET last_seen_at = ? WHERE user_id = ?",
+                    (iso_now(), user_id),
+                )
 
     def get_keywords(self) -> list[str]:
         with closing(self.connect()) as conn:
@@ -241,7 +232,10 @@ class Database:
 
     def remove_keyword(self, keyword: str) -> bool:
         with closing(self.connect()) as conn, conn:
-            cur = conn.execute("DELETE FROM keywords WHERE lower(keyword) = lower(?)", (keyword,))
+            cur = conn.execute(
+                "DELETE FROM keywords WHERE lower(keyword) = lower(?)",
+                (keyword,),
+            )
             return cur.rowcount > 0
 
     def find_player_by_username(self, username: str):
@@ -253,9 +247,11 @@ class Database:
             ).fetchone()
 
     def player_stats(self, user_id: int):
-        start_day = now_local().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=TIMEZONE_OFFSET_HOURS)
-        start_week_local = now_local() - timedelta(days=now_local().weekday())
+        local_now = now_local()
+        start_day = local_now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=TIMEZONE_OFFSET_HOURS)
+        start_week_local = local_now - timedelta(days=local_now.weekday())
         start_week = start_week_local.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=TIMEZONE_OFFSET_HOURS)
+
         with closing(self.connect()) as conn:
             total = conn.execute(
                 "SELECT COALESCE(SUM(contribution_count), 0) AS c FROM contributions WHERE user_id = ?",
@@ -270,37 +266,41 @@ class Database:
                 (user_id, start_week.isoformat()),
             ).fetchone()["c"]
             first = conn.execute(
-                "SELECT added_at, last_seen_at, username, display_name, highest_rank, last_rank FROM tracked_players WHERE user_id = ?",
+                """
+                SELECT added_at, last_seen_at, username, display_name, highest_rank, last_rank
+                FROM tracked_players WHERE user_id = ?
+                """,
                 (user_id,),
             ).fetchone()
-            return {
-                "total": total,
-                "daily": daily,
-                "weekly": weekly,
-                "added_at": first["added_at"] if first else None,
-                "last_seen_at": first["last_seen_at"] if first else None,
-                "username": first["username"] if first else None,
-                "display_name": first["display_name"] if first else None,
-                "highest_rank": first["highest_rank"] if first else None,
-                "current_rank": first["last_rank"] if first else None,
-            }
+
+        return {
+            "total": total,
+            "daily": daily,
+            "weekly": weekly,
+            "added_at": first["added_at"] if first else None,
+            "last_seen_at": first["last_seen_at"] if first else None,
+            "username": first["username"] if first else None,
+            "display_name": first["display_name"] if first else None,
+            "highest_rank": first["highest_rank"] if first else None,
+            "current_rank": first["last_rank"] if first else None,
+        }
 
     def ranked_players(self):
         with closing(self.connect()) as conn:
-            rows = conn.execute(
-                """
-                SELECT p.user_id, p.username, p.display_name,
-                       COALESCE(SUM(c.contribution_count), 0) AS total
+            rows = conn.execute("""
+                SELECT p.user_id, p.username, p.display_name, COALESCE(SUM(c.contribution_count), 0) AS total
                 FROM tracked_players p
                 LEFT JOIN contributions c ON c.user_id = p.user_id
                 GROUP BY p.user_id, p.username, p.display_name
                 ORDER BY total DESC, p.added_at ASC
-                """
-            ).fetchall()
-            ranked = []
-            for i, row in enumerate(rows, start=1):
-                ranked.append({**dict(row), "rank": i})
-            return ranked
+            """).fetchall()
+
+        ranked = []
+        for i, row in enumerate(rows, start=1):
+            item = dict(row)
+            item["rank"] = i
+            ranked.append(item)
+        return ranked
 
     def refresh_ranks(self):
         ranked = self.ranked_players()
@@ -318,7 +318,7 @@ class Database:
                 )
         return ranked
 
-    def recent_messages(self, user_id: int, limit: int = 20):
+    def recent_messages_any_user(self, user_id: int, limit: int = 20):
         with closing(self.connect()) as conn:
             return conn.execute(
                 """
@@ -336,6 +336,24 @@ class Database:
             return conn.execute(
                 "SELECT * FROM tracked_players ORDER BY COALESCE(username, display_name) COLLATE NOCASE"
             ).fetchall()
+
+    def remember_user(self, user: User):
+        username = user.username.lower() if user.username else None
+        display_name = user.full_name or user.first_name or str(user.id)
+        with closing(self.connect()) as conn, conn:
+            existing = conn.execute(
+                "SELECT user_id FROM tracked_players WHERE user_id = ?",
+                (user.id,),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE tracked_players
+                    SET username = ?, display_name = ?, last_seen_at = ?
+                    WHERE user_id = ?
+                    """,
+                    (username, display_name, iso_now(), user.id),
+                )
 
     def add_note(self, player_user_id: int, note_text: str, issuer_user_id: int, issuer_name: str):
         with closing(self.connect()) as conn, conn:
@@ -370,7 +388,7 @@ class Database:
                 LIMIT ?
                 """,
                 (player_user_id, limit),
-            ).fetchall()[::-1]
+            ).fetchall()
 
     def delete_notes_by_indexes(self, player_user_id: int, indexes: list[int]) -> int:
         notes = self.get_notes_for_player(player_user_id)
@@ -387,43 +405,32 @@ class Database:
             qmarks = ",".join("?" for _ in ids_to_delete)
             cur = conn.execute(
                 f"DELETE FROM notes WHERE player_user_id = ? AND id IN ({qmarks})",
-                [player_user_id, *ids_to_delete],
+                (player_user_id, *ids_to_delete),
             )
             return cur.rowcount
 
     def players_with_notes_summary(self):
         with closing(self.connect()) as conn:
-            return conn.execute(
-                """
-                SELECT p.user_id, p.username, p.display_name,
-                       COUNT(n.id) AS notes_count,
-                       MAX(n.created_at) AS last_note_at
+            return conn.execute("""
+                SELECT p.user_id, p.username, p.display_name, COUNT(n.id) AS notes_count, MAX(n.created_at) AS last_note_at
                 FROM tracked_players p
                 JOIN notes n ON n.player_user_id = p.user_id
                 GROUP BY p.user_id, p.username, p.display_name
                 ORDER BY COALESCE(p.username, p.display_name) COLLATE NOCASE
-                """
-            ).fetchall()
+            """).fetchall()
 
     def all_notes_grouped(self):
         with closing(self.connect()) as conn:
-            players = conn.execute(
-                """
+            players = conn.execute("""
                 SELECT DISTINCT p.user_id, p.username, p.display_name
                 FROM tracked_players p
                 JOIN notes n ON n.player_user_id = p.user_id
                 ORDER BY COALESCE(p.username, p.display_name) COLLATE NOCASE
-                """
-            ).fetchall()
+            """).fetchall()
             result = []
             for p in players:
                 notes = conn.execute(
-                    """
-                    SELECT id, note_text, issuer_name, created_at
-                    FROM notes
-                    WHERE player_user_id = ?
-                    ORDER BY created_at ASC
-                    """,
+                    "SELECT id, note_text, issuer_name, created_at FROM notes WHERE player_user_id = ? ORDER BY created_at ASC",
                     (p["user_id"],),
                 ).fetchall()
                 result.append({"player": p, "notes": notes})
@@ -441,8 +448,8 @@ def display_handle(row_or_stats) -> str:
 
 def issuer_name_from_user(user: User) -> str:
     if user.username:
-        return user.username
-    return (user.full_name or user.first_name or str(user.id)).strip()
+        return f"@{user.username}"
+    return user.full_name or user.first_name or str(user.id)
 
 
 def format_date_only(iso_text: str) -> str:
@@ -450,7 +457,7 @@ def format_date_only(iso_text: str) -> str:
         dt = datetime.fromisoformat(iso_text)
         return dt.date().isoformat()
     except Exception:
-        return iso_text[:10]
+        return str(iso_text)[:10]
 
 
 def humanize_last_seen(iso_text: Optional[str]) -> str:
@@ -489,6 +496,37 @@ def message_is_contribution(text: str, keywords: list[str]) -> bool:
     return has_keyword or has_three_digit
 
 
+def split_text_chunks(text: str, limit: int | None = None) -> list[str]:
+    if limit is None:
+        limit = MAX_TELEGRAM_MESSAGE
+    if len(text) <= limit:
+        return [text]
+    chunks = []
+    current = []
+    current_len = 0
+    for line in text.splitlines():
+        extra = len(line) + (1 if current else 0)
+        if current and current_len + extra > limit:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = len(line)
+        elif len(line) > limit:
+            if current:
+                chunks.append("\n".join(current))
+                current = []
+                current_len = 0
+            start = 0
+            while start < len(line):
+                chunks.append(line[start:start + limit])
+                start += limit
+        else:
+            current.append(line)
+            current_len += extra
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or [text[:limit]]
+
+
 async def is_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
         admins = await context.bot.get_chat_administrators(chat_id)
@@ -498,10 +536,7 @@ async def is_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYP
 
 
 async def can_add_only(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    user_id = update.effective_user.id
-    if user_id in ADD_ONLY_USER_IDS:
-        return True
-    return False
+    return update.effective_user.id in ADD_ONLY_USER_IDS
 
 
 async def is_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -525,8 +560,8 @@ def get_target_from_reply(update: Update) -> Optional[TargetPlayer]:
     u = msg.reply_to_message.from_user
     return TargetPlayer(
         user_id=u.id,
-        username=(u.username.lower() if u.username else None),
-        display_name=(u.full_name or u.first_name or str(u.id)).strip(),
+        username=u.username.lower() if u.username else None,
+        display_name=u.full_name or u.first_name or str(u.id),
     )
 
 
@@ -541,12 +576,35 @@ def find_target_by_username_arg(username: str) -> Optional[TargetPlayer]:
     )
 
 
-async def send_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+async def send_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
     try:
-        await context.bot.send_message(chat_id=update.effective_user.id, text=text)
+        for chunk in split_text_chunks(text):
+            await context.bot.send_message(chat_id=update.effective_user.id, text=chunk)
         return True
-    except Exception:
+    except Exception as exc:
+        logger.exception("Failed to send private text: %s", exc)
         return False
+
+
+async def send_private_or_group_notice(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    fail_notice: str = "Impossibile inviare un messaggio privato. Per favore, avvia prima il bot in privato (DM).",
+):
+    sent = await send_private_text(update, context, text)
+    if update.effective_chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        if sent:
+            await update.effective_message.reply_text("Segnalazione inviata in privato.")
+        else:
+            await update.effective_message.reply_text(fail_notice)
+    return sent
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "Bot is active. You can now receive private reports."
+    )
 
 
 async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -554,6 +612,7 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = update.effective_message
     target_user = None
+
     if msg.reply_to_message and msg.reply_to_message.from_user:
         target_user = msg.reply_to_message.from_user
     elif context.args and context.args[0].startswith("@"):
@@ -567,40 +626,42 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             target_user = TempUser()
         else:
             return
+
     if not target_user:
         return
+
     inserted = db.upsert_player(target_user, update.effective_user.id)
     handle = f"@{target_user.username}" if getattr(target_user, "username", None) else (target_user.full_name or target_user.first_name)
+
     if inserted:
         await msg.reply_text(f"{handle} è stato aggiunto al sistema di monitoraggio Elite.")
     else:
         await msg.reply_text(f"{handle} è già presente nel sistema di monitoraggio.")
 
-
 async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_authorized(update, context):
         return
-    msg = update.effective_message
     target = get_target_from_reply(update)
     if not target and context.args and context.args[0].startswith("@"):
         target = find_target_by_username_arg(context.args[0])
     if not target:
         return
     db.remove_player(target.user_id)
-
+    await update.effective_message.reply_text(f"{display_handle({'username': target.username, 'display_name': target.display_name})} removed from tracking.")
 
 async def ch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_authorized(update, context):
         return
-    msg = update.effective_message
     target = get_target_from_reply(update)
     if not target and context.args and context.args[0].startswith("@"):
         target = find_target_by_username_arg(context.args[0])
     if not target:
         return
+
     db.refresh_ranks()
     stats = db.player_stats(target.user_id)
     handle = f"@{stats['username']}" if stats["username"] else stats["display_name"]
+
     lines = [
         f"Player: {handle}",
         "",
@@ -611,95 +672,64 @@ async def ch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Last Seen: {humanize_last_seen(stats['last_seen_at'])}",
         f"Tracked Since: {format_date_only(stats['added_at'])}",
     ]
+
     recent_notes = db.get_recent_notes_for_player(target.user_id, 3)
     if recent_notes:
         lines += ["", "Recent Notes:"]
         for n in recent_notes:
             lines.append(f"- {format_date_only(n['created_at'])} | {n['note_text']} | by {n['issuer_name']}")
-    await send_private_text(update, context, "\n".join(lines))
 
+    await send_private_or_group_notice(update, context, "\n".join(lines))
 
 async def msg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_authorized(update, context):
         return
-    if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        return
-
-    target = get_target_from_reply(update)
-    if not target:
-        await update.effective_message.reply_text("Reply to the player's message, then use .msg or .msg 50.")
-        return
-
-    limit = 20
-    if context.args and context.args[0].isdigit():
-        limit = max(1, min(100, int(context.args[0])))
-
-    rows = db.recent_messages_by_chat(target.user_id, update.effective_chat.id, limit)
-    handle = f"@{target.username}" if target.username else target.display_name
-
-    if not rows:
-        await update.effective_message.reply_text(f"No stored messages found for {handle} in this group.")
-        return
-
-    lines = [f"Last Messages for {handle}", ""]
-    for i, r in enumerate(rows, start=1):
-        marker = "+1" if r["contribution_count"] else "0"
-        lines.append(f"{i}. [{format_date_time_local(r['created_at'])}] ({marker}) {r['message_text']}")
-
-    for chunk in split_text_chunks("\n".join(lines)):
-        await update.effective_message.reply_text(chunk)
-
-
-async def msg_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_authorized(update, context):
-        return
-    if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        return
-
-    target = get_target_from_reply(update)
-    if not target:
-        await update.effective_message.reply_text("Reply to the player's message, then use .msg_all or .msg_all 50.")
-        return
-
-    limit = 20
-    if context.args and context.args[0].isdigit():
-        limit = max(1, min(100, int(context.args[0])))
-
-    rows = db.recent_messages_any_user(target.user_id, limit)
-    handle = f"@{target.username}" if target.username else target.display_name
-
-    if not rows:
-        await update.effective_message.reply_text(f"No stored messages found for {handle}.")
-        return
-
-    lines = [f"Last Messages for {handle} (All Groups)", ""]
-    for i, r in enumerate(rows, start=1):
-        marker = "+1" if r["contribution_count"] else "0"
-        lines.append(f"{i}. [{format_date_time_local(r['created_at'])}] ({marker}) {r['message_text']}")
-
-    for chunk in split_text_chunks("\n".join(lines)):
-        await update.effective_message.reply_text(chunk)
-
-
-async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_authorized(update, context):
-        return
-    msg = update.effective_message
     target = get_target_from_reply(update)
     if not target and context.args and context.args[0].startswith("@"):
         target = find_target_by_username_arg(context.args[0])
     if not target:
         return
+
+    limit = 20
+    if len(context.args) >= 2 and context.args[1].isdigit():
+        limit = max(1, min(100, int(context.args[1])))
+
+    rows = db.recent_messages_any_user(target.user_id, limit)
+    handle = f"@{target.username}" if target.username else target.display_name
+
+    if not rows:
+        await send_private_or_group_notice(update, context, f"No stored messages found for {handle}.")
+        return
+
+    lines = [f"Last Messages for {handle}", ""]
+    for i, r in enumerate(rows, start=1):
+        marker = "+1" if r["contribution_count"] else "0"
+        lines.append(f"{i}. [{format_date_only(r['created_at'])}] ({marker}) {r['message_text']}")
+
+    await send_private_or_group_notice(update, context, "\n".join(lines))
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update, context):
+        return
+    target = get_target_from_reply(update)
+    if not target and context.args and context.args[0].startswith("@"):
+        target = find_target_by_username_arg(context.args[0])
+    if not target:
+        return
+
     db.refresh_ranks()
     stats = db.player_stats(target.user_id)
     handle = f"@{stats['username']}" if stats["username"] else stats["display_name"]
     tracked_since = format_date_only(stats["added_at"])
+
     try:
         start = datetime.fromisoformat(stats["added_at"]) if stats["added_at"] else now_utc()
         days = max(1, (now_utc() - start).days + 1)
     except Exception:
         days = 1
+
     avg_daily = round(stats["total"] / days)
+
     lines = [
         f"Player: {handle}",
         "",
@@ -710,13 +740,14 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Current Rank: #{stats['current_rank'] or '-'}",
         f"Last Seen: {humanize_last_seen(stats['last_seen_at'])}",
     ]
+
     notes = db.get_notes_for_player(target.user_id)
     if notes:
         lines += ["", "All Notes:"]
         for i, n in enumerate(notes, start=1):
             lines.append(f"{i}. {format_date_only(n['created_at'])} | {n['note_text']} | by {n['issuer_name']}")
-    await send_private_text(update, context, "\n".join(lines))
 
+    await send_private_or_group_notice(update, context, "\n".join(lines))
 
 async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_authorized(update, context):
@@ -726,58 +757,61 @@ async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for item in ranked:
         handle = f"@{item['username']}" if item["username"] else item["display_name"]
         lines.append(f"#{item['rank']} {handle} - {item['total']}")
-    await send_private_text(update, context, "\n".join(lines))
-
+    await send_private_or_group_notice(update, context, "\n".join(lines))
 
 async def suspects_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_authorized(update, context):
         return
     ranked = db.refresh_ranks()
-    suspects = [r for r in ranked if r["total"] <= SUSPECT_THRESHOLD]
+    suspects = [r for r in ranked if r["total"] < SUSPECT_THRESHOLD]
     lines = ["Potential Inactive Players", ""]
     for item in suspects:
         handle = f"@{item['username']}" if item["username"] else item["display_name"]
         lines.append(f"{handle} - {item['total']} contributions")
-    await send_private_text(update, context, "\n".join(lines))
-
+    await send_private_or_group_notice(update, context, "\n".join(lines))
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_authorized(update, context):
         return
     rows = db.tracked_players()
+    if not rows:
+        await send_private_or_group_notice(update, context, "Tracked Players (0)")
+        return
     lines = [f"Tracked Players ({len(rows)})", ""]
-    for r in rows:
-        lines.append(display_handle(r))
-    await send_private_text(update, context, "\n".join(lines))
-
+    for i, r in enumerate(rows, start=1):
+        lines.append(f"{i}. {display_handle(r)}")
+    await send_private_or_group_notice(update, context, "\n".join(lines))
 
 async def addkw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_authorized(update, context):
         return
     if not context.args:
         return
-    db.add_keyword(" ".join(context.args).strip(), update.effective_user.id)
-
+    keyword = " ".join(context.args).strip()
+    if db.add_keyword(keyword, update.effective_user.id):
+        await update.effective_message.reply_text(f"Keyword added: {keyword}")
 
 async def removekw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_authorized(update, context):
         return
     if not context.args:
         return
-    db.remove_keyword(" ".join(context.args).strip())
-
+    keyword = " ".join(context.args).strip()
+    if db.remove_keyword(keyword):
+        await update.effective_message.reply_text(f"Keyword removed: {keyword}")
 
 async def keywords_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_authorized(update, context):
         return
     lines = ["Keywords", ""] + db.get_keywords()
-    await send_private_text(update, context, "\n".join(lines))
-
+    await send_private_or_group_notice(update, context, "\n".join(lines))
 
 async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_authorized(update, context):
         return
+
     args = context.args
+
     if not args:
         rows = db.players_with_notes_summary()
         if not rows:
@@ -786,9 +820,10 @@ async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = ["Players With Notes", ""]
         for r in rows:
             handle = f"@{r['username']}" if r["username"] else r["display_name"]
-            lines.append(f"{handle} — {r['notes_count']} notes")
-        await send_private_text(update, context, "\n".join(lines))
+            lines.append(f"{handle} - {r['notes_count']} notes")
+        await send_private_or_group_notice(update, context, "\n".join(lines))
         return
+
     if len(args) == 1 and args[0].lower() == "full":
         grouped = db.all_notes_grouped()
         if not grouped:
@@ -802,8 +837,9 @@ async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for i, n in enumerate(block["notes"], start=1):
                 lines.append(f"{i}. {format_date_only(n['created_at'])} | {n['note_text']} | by {n['issuer_name']}")
             lines.append("")
-        await send_private_text(update, context, "\n".join(lines).strip())
+        await send_private_or_group_notice(update, context, "\n".join(lines).strip())
         return
+
     if len(args) == 1 and args[0].startswith("@"):
         target = find_target_by_username_arg(args[0])
         if not target:
@@ -817,15 +853,16 @@ async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = [f"Notes for {handle}", ""]
         for i, n in enumerate(notes, start=1):
             lines.append(f"{i}. {format_date_only(n['created_at'])} | {n['note_text']} | by {n['issuer_name']}")
-        await send_private_text(update, context, "\n".join(lines))
+        await send_private_or_group_notice(update, context, "\n".join(lines))
         return
-    await send_private_text(update, context, "Usage:\n/notes\n/notes full\n/notes @username")
 
+    await send_private_text(update, context, "Usage: /notes | /notes full | /notes @username")
 
 async def handle_dot_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg or not msg.text or update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
+
     text = msg.text.strip()
 
     if text.lower() == ".add":
@@ -834,11 +871,13 @@ async def handle_dot_commands(update: Update, context: ContextTypes.DEFAULT_TYPE
         target = get_target_from_reply(update)
         if not target:
             return
+
         class TempUser:
             id = target.user_id
             username = target.username
             full_name = target.display_name
             first_name = target.display_name
+
         inserted = db.upsert_player(TempUser(), update.effective_user.id)
         handle = f"@{target.username}" if target.username else target.display_name
         if inserted:
@@ -897,7 +936,7 @@ async def handle_dot_commands(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not await is_authorized(update, context):
             return
         parts = text.split()[1:]
-        context.args = ["", *parts] if parts else []
+        context.args = parts if parts else []
         await msg_command(update, context)
         return
 
@@ -908,18 +947,21 @@ async def handle_dot_commands(update: Update, context: ContextTypes.DEFAULT_TYPE
         await history_command(update, context)
         return
 
-
 async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg or not msg.text or msg.text.startswith("/") or msg.text.startswith("."):
         return
-    user = msg.from_user
-    if not user or not db.is_tracked(user.id):
-        return
-    db.update_seen(user)
-    is_contrib = message_is_contribution(msg.text, db.get_keywords())
-    db.add_message(user.id, update.effective_chat.id, msg.message_id, msg.text, is_contrib)
 
+    user = msg.from_user
+    if not user:
+        return
+
+    is_contrib = False
+    if db.is_tracked(user.id):
+        db.update_seen(user)
+        is_contrib = message_is_contribution(msg.text, db.get_keywords())
+
+    db.add_message(user.id, update.effective_chat.id, msg.message_id, msg.text, is_contrib)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Unhandled exception: %s", context.error)
@@ -927,12 +969,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is missing")
+
     app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("add", add_command))
     app.add_handler(CommandHandler("remove", remove_command))
     app.add_handler(CommandHandler("ch", ch_command))
     app.add_handler(CommandHandler("msg", msg_command))
-    app.add_handler(CommandHandler("msg_all", msg_all_command))
     app.add_handler(CommandHandler("history", history_command))
     app.add_handler(CommandHandler("top", top_command))
     app.add_handler(CommandHandler("suspects", suspects_command))
@@ -941,11 +985,12 @@ def main():
     app.add_handler(CommandHandler("removekw", removekw_command))
     app.add_handler(CommandHandler("keywords", keywords_command))
     app.add_handler(CommandHandler("notes", notes_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_dot_commands))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, track_messages))
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_dot_commands), group=0)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, track_messages), group=1)
+
     app.add_error_handler(error_handler)
     app.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()
