@@ -322,13 +322,26 @@ class Database:
         with closing(self.connect()) as conn:
             return conn.execute(
                 """
-                SELECT message_text, contribution_count, created_at
+                SELECT message_text, contribution_count, created_at, chat_id
                 FROM contributions
                 WHERE user_id = ?
                 ORDER BY created_at DESC
                 LIMIT ?
                 """,
                 (user_id, limit),
+            ).fetchall()
+
+    def recent_messages_in_chat(self, user_id: int, chat_id: int, limit: int = 20):
+        with closing(self.connect()) as conn:
+            return conn.execute(
+                """
+                SELECT message_text, contribution_count, created_at, chat_id
+                FROM contributions
+                WHERE user_id = ? AND chat_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (user_id, chat_id, limit),
             ).fetchall()
 
     def tracked_players(self):
@@ -460,11 +473,30 @@ def format_date_only(iso_text: str) -> str:
         return str(iso_text)[:10]
 
 
+def to_local_datetime(iso_text: str) -> Optional[datetime]:
+    try:
+        dt = datetime.fromisoformat(iso_text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt + timedelta(hours=TIMEZONE_OFFSET_HOURS)
+    except Exception:
+        return None
+
+
+def format_local_timestamp(iso_text: str) -> str:
+    dt = to_local_datetime(iso_text)
+    if not dt:
+        return str(iso_text)[:16]
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
 def humanize_last_seen(iso_text: Optional[str]) -> str:
     if not iso_text:
         return "Unknown"
     try:
         dt = datetime.fromisoformat(iso_text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
         diff = now_utc() - dt
         seconds = int(diff.total_seconds())
         if seconds < 60:
@@ -694,6 +726,38 @@ async def msg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) >= 2 and context.args[1].isdigit():
         limit = max(1, min(100, int(context.args[1])))
 
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    rows = db.recent_messages_in_chat(target.user_id, chat.id, limit)
+    handle = f"@{target.username}" if target.username else target.display_name
+
+    if not rows:
+        await send_private_or_group_notice(update, context, f"No stored messages found for {handle} in this group.")
+        return
+
+    lines = [f"Last Messages for {handle} in this group", ""]
+    for i, r in enumerate(rows, start=1):
+        marker = "+1" if r["contribution_count"] else "0"
+        lines.append(f"{i}. [{format_local_timestamp(r['created_at'])}] ({marker}) {r['message_text']}")
+
+    await send_private_or_group_notice(update, context, "\n".join(lines))
+
+
+async def msg_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update, context):
+        return
+    target = get_target_from_reply(update)
+    if not target and context.args and context.args[0].startswith("@"):
+        target = find_target_by_username_arg(context.args[0])
+    if not target:
+        return
+
+    limit = 20
+    if len(context.args) >= 2 and context.args[1].isdigit():
+        limit = max(1, min(100, int(context.args[1])))
+
     rows = db.recent_messages_any_user(target.user_id, limit)
     handle = f"@{target.username}" if target.username else target.display_name
 
@@ -701,10 +765,10 @@ async def msg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_private_or_group_notice(update, context, f"No stored messages found for {handle}.")
         return
 
-    lines = [f"Last Messages for {handle}", ""]
+    lines = [f"Last Messages for {handle} in all groups", ""]
     for i, r in enumerate(rows, start=1):
         marker = "+1" if r["contribution_count"] else "0"
-        lines.append(f"{i}. [{format_date_only(r['created_at'])}] ({marker}) {r['message_text']}")
+        lines.append(f"{i}. [{format_local_timestamp(r['created_at'])}] ({marker}) {r['message_text']}")
 
     await send_private_or_group_notice(update, context, "\n".join(lines))
 
@@ -932,6 +996,14 @@ async def handle_dot_commands(update: Update, context: ContextTypes.DEFAULT_TYPE
         await ch_command(update, context)
         return
 
+    if text.lower().startswith(".msg_all"):
+        if not await is_authorized(update, context):
+            return
+        parts = text.split()[1:]
+        context.args = parts if parts else []
+        await msg_all_command(update, context)
+        return
+
     if text.lower().startswith(".msg"):
         if not await is_authorized(update, context):
             return
@@ -977,6 +1049,7 @@ def main():
     app.add_handler(CommandHandler("remove", remove_command))
     app.add_handler(CommandHandler("ch", ch_command))
     app.add_handler(CommandHandler("msg", msg_command))
+    app.add_handler(CommandHandler("msg_all", msg_all_command))
     app.add_handler(CommandHandler("history", history_command))
     app.add_handler(CommandHandler("top", top_command))
     app.add_handler(CommandHandler("suspects", suspects_command))
