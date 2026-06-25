@@ -921,6 +921,9 @@ async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.add_message(user.id, update.effective_chat.id, msg.message_id, msg.text, is_contrib)
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled exception: %s", context.error)
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is missing")
