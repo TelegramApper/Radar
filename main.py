@@ -622,8 +622,12 @@ async def ch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def msg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_authorized(update, context):
         return
+    if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+
     target = get_target_from_reply(update)
     if not target:
+        await update.effective_message.reply_text("Reply to the player's message, then use .msg or .msg 50.")
         return
 
     limit = 20
@@ -649,8 +653,12 @@ async def msg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def msg_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_authorized(update, context):
         return
+    if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+
     target = get_target_from_reply(update)
     if not target:
+        await update.effective_message.reply_text("Reply to the player's message, then use .msg_all or .msg_all 50.")
         return
 
     limit = 20
@@ -932,6 +940,7 @@ def main():
     app.add_handler(CommandHandler("notes", notes_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_dot_commands))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, track_messages))
+    app.add_error_handler(error_handler)
     app.run_polling(drop_pending_updates=True)
 
 
