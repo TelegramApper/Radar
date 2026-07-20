@@ -30,7 +30,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("fc26elite-tracker")
 
-OWNER_ID = int(os.getenv("OWNER_ID", "813607344"))
+OWNER_IDS = {
+    int(os.getenv("OWNER_ID", "813607344")),
+    7629122327,
+}
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DB_PATH = os.getenv("DB_PATH", "data/fc26_elite_tracker.db")
 TIMEZONE_OFFSET_HOURS = int(os.getenv("TIMEZONE_OFFSET_HOURS", "2"))
@@ -678,7 +681,7 @@ async def can_add_only(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
 
 async def is_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_id = update.effective_user.id if update.effective_user else None
-    if user_id == OWNER_ID:
+    if user_id in OWNER_IDS:
         return True
 
     chat = update.effective_chat
