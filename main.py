@@ -63,6 +63,7 @@ DEFAULT_KEYWORDS = [
     "Andate",
     "Let's go",
     "Go",
+    "Search",
     "Gift",
 ]
 
