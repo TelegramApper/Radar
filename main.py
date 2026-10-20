@@ -18,9 +18,11 @@ from telegram import Update, User
 from telegram.constants import ChatType
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -65,6 +67,10 @@ DEFAULT_KEYWORDS = [
 ]
 
 THREE_DIGIT_RE = re.compile(r"(?<!\d)(\d{3})(?!\d)")
+
+# Bot works ONLY in these places (plus private chats)
+ALLOWED_TOPICS = {(-1002415746359, 3759933)}
+ALLOWED_GROUP_USERNAMES = {"treninokanottari"}
 
 
 def now_utc() -> datetime:
@@ -149,7 +155,7 @@ class Database:
             if existing == 0:
                 conn.executemany(
                     "INSERT OR IGNORE INTO keywords(keyword, added_at, added_by) VALUES (?, ?, ?)",
-                    [(kw, iso_now(), OWNER_ID) for kw in DEFAULT_KEYWORDS],
+                    [(kw, iso_now(), None) for kw in DEFAULT_KEYWORDS],
                 )
 
     def upsert_player(self, user: User, added_by: int) -> bool:
@@ -665,6 +671,28 @@ def build_season_pdf_report(pdf_path: str):
 
     doc.build(story)
 
+
+
+async def location_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat is None:
+        raise ApplicationHandlerStop
+
+    # Private chats allowed (/start and private reports)
+    if chat.type == ChatType.PRIVATE:
+        return
+
+    # Whole public group
+    if chat.username and chat.username.lower() in ALLOWED_GROUP_USERNAMES:
+        return
+
+    # Specific topic only
+    msg = update.effective_message
+    thread_id = msg.message_thread_id if msg else None
+    if (chat.id, thread_id) in ALLOWED_TOPICS:
+        return
+
+    raise ApplicationHandlerStop
 
 
 async def is_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1208,6 +1236,8 @@ def main():
         raise RuntimeError("BOT_TOKEN is missing")
 
     app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(TypeHandler(Update, location_gate), group=-1)
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("add", add_command))
